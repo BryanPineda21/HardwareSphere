@@ -1,6 +1,7 @@
 const { firestore, storage, admin } = require('../config/firebase');
 const fileService = require('./file-service');
 const conversionService = require('./conversion-service');
+const redisClient = require('../config/redis'); // ✅ NEW: Added for cache invalidation
 const path = require('path');
 
 // --- NEW: Helper function to generate secure, temporary URLs ---
@@ -28,7 +29,6 @@ async function generateSignedUrl(filePath) {
     return null; // Return null if there's an error
   }
 }
-
 
 class ProjectService {
 
@@ -159,7 +159,14 @@ class ProjectService {
       };
       
       finalUpdate['files.model.glb'] = admin.firestore.FieldValue.delete();
-      finalUpdate.conversionStatus = { /* ... reset status ... */ };
+      finalUpdate.conversionStatus = {
+        stlFiles: 1,
+        convertedFiles: 0,
+        inProgress: true,
+        completed: false,
+        errors: [],
+        startedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
     }
 
     if (newBannerFile) {
@@ -185,6 +192,14 @@ class ProjectService {
     }
 
     await projectRef.update(finalUpdate);
+
+    // ✅ NEW: Invalidate Redis cache when project is updated
+    try {
+      await redisClient.del(`project:${projectId}`);
+      console.log(`💾 Cache invalidated for updated project: ${projectId}`);
+    } catch (cacheError) {
+      console.warn('Cache invalidation failed:', cacheError.message);
+    }
 
     if (newModelFile && newModelFile.path) {
       setTimeout(() => {
@@ -303,6 +318,7 @@ class ProjectService {
     if (!projectDoc.exists) throw new Error('Project not found.');
     const projectData = projectDoc.data();
     if (projectData.userId !== userId) throw new Error('You do not have permission to delete this project.');
+    
     const bucket = admin.storage().bucket();
     const prefix = `projects/${userId}/${projectId}/`;
     try {
@@ -310,12 +326,56 @@ class ProjectService {
     } catch (error) {
       console.error(`Failed to delete files for project ${projectId}. Manual cleanup may be required.`, error);
     }
+    
     await projectRef.delete();
+
+    // ✅ NEW: Invalidate cache when project is deleted
+    try {
+      await redisClient.del(`project:${projectId}`);
+      await redisClient.del(`user:${userId}:projects`);
+      console.log(`💾 Cache invalidated for deleted project: ${projectId}`);
+    } catch (cacheError) {
+      console.warn('Cache invalidation failed:', cacheError.message);
+    }
+
     return { success: true, message: 'Project and all associated files deleted.' };
+  }
+
+  // ✅ NEW: Enhanced temp file cleanup method
+  async enhancedCleanup(filePaths, description = "") {
+    if (!filePaths || filePaths.length === 0) return;
+    
+    console.log(`🧹 Starting cleanup: ${description}`);
+    
+    const fileObjects = filePaths
+      .filter(p => p && typeof p === 'string')
+      .map(p => ({ path: p }));
+    
+    if (fileObjects.length > 0) {
+      try {
+        await fileService.cleanupTempFiles(fileObjects);
+        console.log(`✅ Cleanup successful: ${fileObjects.length} files removed`);
+      } catch (err) {
+        console.error(`❌ Cleanup failed: ${err.message}`);
+        
+        // Fallback: Try manual cleanup
+        const fs = require('fs').promises;
+        for (const file of fileObjects) {
+          try {
+            await fs.unlink(file.path);
+            console.log(`🗑️ Manual cleanup successful: ${file.path}`);
+          } catch (unlinkErr) {
+            console.warn(`⚠️ Manual cleanup failed: ${file.path} - ${unlinkErr.message}`);
+          }
+        }
+      }
+    }
   }
 
   async startBackgroundConversionForUpdate(projectId, userId, stlFile) {
     console.log(`🔄 Starting background conversion for updated model in project ${projectId}`);
+    const tempFilesToCleanup = [stlFile.path].filter(Boolean);
+    
     try {
       await new Promise(resolve => setTimeout(resolve, 500));
       const glbResult = await this.convertStlFile(projectId, userId, stlFile);
@@ -337,53 +397,104 @@ class ProjectService {
           'conversionStatus.lastUpdate': admin.firestore.FieldValue.serverTimestamp()
         });
       });
+
+      // ✅ NEW: Invalidate cache after conversion completes
+      try {
+        await redisClient.del(`project:${projectId}`);
+        console.log(`💾 Cache invalidated after model conversion: ${projectId}`);
+      } catch (cacheError) {
+        console.warn('Cache invalidation failed after conversion:', cacheError.message);
+      }
+
     } catch (error) {
-      await this.updateConversionStatus(projectId, { errors: [{ fileName: stlFile.originalname, error: error.message, timestamp: new Date() }], inProgress: false, completed: true, completedAt: new Date() });
+      await this.updateConversionStatus(projectId, { 
+        errors: [{ fileName: stlFile.originalname, error: error.message, timestamp: new Date() }], 
+        inProgress: false, 
+        completed: true, 
+        completedAt: new Date() 
+      });
       throw error;
     } finally {
-      if (stlFile.path) await fileService.cleanupTempFiles([stlFile]);
+      // ✅ IMPROVED: Always clean up temp files
+      await this.enhancedCleanup(tempFilesToCleanup, "background conversion update cleanup");
     }
   }
 
   async startBackgroundConversion(projectId, userId, stlFiles) {
     console.log(`🔄 Starting background conversion for project ${projectId}`);
+    const tempFilesToCleanup = stlFiles.map(f => f.path).filter(Boolean);
+    
     try {
       for (let i = 0; i < stlFiles.length; i++) {
         const stlFile = stlFiles[i];
         try {
-          await this.updateConversionStatus(projectId, { currentFile: stlFile.originalname, progress: Math.round((i / stlFiles.length) * 100) });
+          await this.updateConversionStatus(projectId, { 
+            currentFile: stlFile.originalname, 
+            progress: Math.round((i / stlFiles.length) * 100) 
+          });
           const glbResult = await this.convertStlFile(projectId, userId, stlFile);
           await this.addConvertedFile(projectId, stlFile.originalname, glbResult);
         } catch (error) {
           await this.addConversionError(projectId, stlFile.originalname, error.message);
         }
       }
+
+      // ✅ NEW: Invalidate cache after all conversions complete
+      try {
+        await redisClient.del(`project:${projectId}`);
+        console.log(`💾 Cache invalidated after background conversion: ${projectId}`);
+      } catch (cacheError) {
+        console.warn('Cache invalidation failed after background conversion:', cacheError.message);
+      }
+
     } finally {
-      await fileService.cleanupTempFiles(stlFiles);
-      await this.updateConversionStatus(projectId, { inProgress: false, completed: true, completedAt: new Date(), progress: 100 });
+      // ✅ IMPROVED: Always clean up ALL temp files
+      await this.enhancedCleanup(tempFilesToCleanup, "background conversion cleanup");
+      await this.updateConversionStatus(projectId, { 
+        inProgress: false, 
+        completed: true, 
+        completedAt: new Date(), 
+        progress: 100 
+      });
     }
   }
 
   async convertStlFile(projectId, userId, stlFile) {
     const glbFileName = stlFile.originalname.replace(/\.stl$/i, '.glb');
     const glbTempPath = path.join('uploads', `converted-${projectId}-${Date.now()}-${glbFileName}`);
+    
     try {
       if (!stlFile.path) throw new Error('STL file path is missing for conversion');
+      
       const conversionResult = await conversionService.convertStlToGltf(stlFile.path, glbTempPath);
       const glbStoragePath = `projects/${userId}/${projectId}/models/${glbFileName}`;
-      const uploadResult = await fileService.uploadToFirebase({ path: conversionResult.filePath, originalname: glbFileName, mimetype: 'model/gltf-binary' }, glbStoragePath);
-      await this.safeCleanup([conversionResult.filePath]);
-      return { ...uploadResult, conversionStats: { /* ... */ } };
+      const uploadResult = await fileService.uploadToFirebase(
+        { path: conversionResult.filePath, originalname: glbFileName, mimetype: 'model/gltf-binary' }, 
+        glbStoragePath
+      );
+      
+      // ✅ IMPROVED: Clean up conversion temp file immediately after upload
+      await this.enhancedCleanup([conversionResult.filePath], "post-conversion GLB file");
+      
+      return { 
+        ...uploadResult, 
+        conversionStats: { 
+          originalSize: stlFile.size || 0,
+          convertedSize: uploadResult.size || 0,
+          conversionTime: Date.now()
+        } 
+      };
     } catch (error) {
-      await this.safeCleanup([glbTempPath]);
+      // ✅ IMPROVED: Clean up temp files even on error
+      await this.enhancedCleanup([glbTempPath], "failed conversion cleanup");
       throw error;
     }
   }
 
+  // ✅ DEPRECATED: Replaced by enhancedCleanup
   async safeCleanup(filePaths) {
-    if (!filePaths || filePaths.length === 0) return;
-    const fileObjects = filePaths.filter(p => p).map(p => ({ path: p }));
-    if (fileObjects.length > 0) await fileService.cleanupTempFiles(fileObjects).catch(err => console.warn(`Warning: Cleanup failed: ${err.message}`));
+    console.warn('safeCleanup is deprecated, use enhancedCleanup instead');
+    await this.enhancedCleanup(filePaths, "legacy cleanup");
   }
 
   async updateConversionStatus(projectId, statusUpdates) {
@@ -399,7 +510,13 @@ class ProjectService {
 
   async addConversionError(projectId, fileName, errorMessage) {
     try {
-      await firestore.collection('projects').doc(projectId).update({ 'conversionStatus.errors': admin.firestore.FieldValue.arrayUnion({ fileName, error: errorMessage, timestamp: new Date() }) });
+      await firestore.collection('projects').doc(projectId).update({ 
+        'conversionStatus.errors': admin.firestore.FieldValue.arrayUnion({ 
+          fileName, 
+          error: errorMessage, 
+          timestamp: new Date() 
+        }) 
+      });
     } catch (error) {
       console.error('Error adding conversion error:', error);
     }
@@ -422,12 +539,14 @@ class ProjectService {
     return userDoc.exists ? userDoc.data().displayName || 'Unknown Author' : 'Unknown Author';
   }
   
-  // ✅ NEW: Helper method to get the user's avatar URL.
+  // ✅ FIXED: Changed field name from 'photoURL' to 'avatar'
   async getAvatarFromUserId(userId) {
     try {
       const userDoc = await firestore.collection('users').doc(userId).get();
-      // Assumes the avatar URL is stored in a field named 'photoURL'.
-      if (userDoc.exists) { return userDoc.data().photoURL || null; }
+      if (userDoc.exists) { 
+        // Changed from 'photoURL' to 'avatar' to match your users schema
+        return userDoc.data().avatar || null; 
+      }
       return null;
     } catch (error) {
       console.error('Error fetching user avatar:', error);
@@ -444,7 +563,19 @@ class ProjectService {
   }
   
   determineCategory(tags) {
-    const categories = { /* ... */ };
+    const categories = {
+      mechanical: ['mechanical', 'gear', 'engine', 'motor', 'machine'],
+      electronics: ['electronic', 'circuit', 'pcb', 'arduino', 'raspberry'],
+      automotive: ['car', 'automotive', 'vehicle', 'wheel', 'brake'],
+      architecture: ['building', 'house', 'architecture', 'structure'],
+      art: ['art', 'sculpture', 'decorative', 'ornament'],
+      gaming: ['game', 'gaming', 'character', 'weapon', 'prop'],
+      medical: ['medical', 'prosthetic', 'anatomical', 'dental'],
+      aerospace: ['aerospace', 'aircraft', 'drone', 'rocket', 'space'],
+      jewelry: ['jewelry', 'ring', 'pendant', 'bracelet'],
+      tools: ['tool', 'wrench', 'hammer', 'screwdriver']
+    };
+    
     if (!Array.isArray(tags)) return 'general';
     const lowerTags = tags.map(t => t ? t.toLowerCase() : '').filter(Boolean);
     for (const [category, keywords] of Object.entries(categories)) {

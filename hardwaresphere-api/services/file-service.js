@@ -3,17 +3,30 @@ const fs = require('fs').promises;
 const path = require('path');
 
 class FileService {
+  constructor() {
+    // Track temp files for cleanup (optional debugging)
+    this.tempFilesCreated = new Set();
+    this.tempFilesCleanedUp = new Set();
+  }
+
   /**
-   * Upload a file to Firebase Storage
+   * Upload a file to Firebase Storage with automatic temp cleanup
    * @param {Object} file - Multer file object
    * @param {string} storagePath - Path in Firebase Storage (e.g., 'projects/userId/projectId/model.stl')
    * @returns {Promise<Object>} - Object with downloadURL and metadata
    */
   async uploadToFirebase(file, storagePath) {
+    let tempFilePath = null;
+    
     try {
-      console.log(`Uploading ${file.originalname} to ${storagePath}`);
+      console.log(`📤 Uploading ${file.originalname} to ${storagePath}`);
       
-      // --- FIX: Use the storage object directly ---
+      // Track temp file if it exists
+      if (file.path) {
+        tempFilePath = file.path;
+        this.tempFilesCreated.add(tempFilePath);
+      }
+      
       const bucket = storage.bucket();
       const fileUpload = bucket.file(storagePath);
 
@@ -35,7 +48,7 @@ class FileService {
       await new Promise((resolve, reject) => {
         stream.on('error', reject);
         stream.on('finish', resolve);
-        stream.end(buffer); // Use the buffer here
+        stream.end(buffer);
       });
       
       // Make file publicly readable
@@ -47,7 +60,12 @@ class FileService {
       // Get file metadata
       const [metadata] = await fileUpload.getMetadata();
       
-      console.log(`Successfully uploaded ${file.originalname}`);
+      console.log(`✅ Successfully uploaded ${file.originalname}`);
+      
+      // ✅ NEW: Clean up temp file immediately after successful upload
+      if (tempFilePath) {
+        await this.cleanupSingleTempFile(tempFilePath);
+      }
       
       return {
         url: downloadURL,
@@ -59,13 +77,21 @@ class FileService {
       };
       
     } catch (error) {
-      console.error(`Error uploading ${file.originalname}:`, error);
+      console.error(`❌ Error uploading ${file.originalname}:`, error);
+      
+      // ✅ NEW: Clean up temp file even on upload failure
+      if (tempFilePath) {
+        await this.cleanupSingleTempFile(tempFilePath).catch(cleanupErr => 
+          console.warn(`⚠️ Cleanup failed for ${tempFilePath}:`, cleanupErr.message)
+        );
+      }
+      
       throw new Error(`Failed to upload ${file.originalname}: ${error.message}`);
     }
   }
   
   /**
-   * Upload multiple project files to Firebase Storage
+   * Upload multiple project files to Firebase Storage with enhanced cleanup
    * @param {Array} files - Array of multer file objects
    * @param {string} userId - User ID
    * @param {string} projectId - Project ID
@@ -77,40 +103,54 @@ class FileService {
       attachments: []
     };
     
-    for (const file of files) {
-      try {
-        const fileType = this.getFileType(file);
-        const fileName = this.sanitizeFileName(file.originalname);
-        const storagePath = `projects/${userId}/${projectId}/${fileType}s/${fileName}`;
-        
-        const uploadResult = await this.uploadToFirebase(file, storagePath);
-        
-        const fileData = {
-          ...uploadResult,
-          type: fileType,
-          filename: fileName
-        };
-        
-        if (fileType === 'model') {
-          uploadedFiles.models.push(fileData);
-        } else {
-          uploadedFiles.attachments.push({
-            ...fileData,
-            description: this.getFileDescription(fileType)
-          });
-        }
-        
-      } catch (error) {
-        console.error(`Failed to upload ${file.originalname}:`, error);
-        // Continue with other files, but log the error
-      }
-    }
+    // ✅ NEW: Track all temp files for cleanup
+    const tempFilesToCleanup = files.map(f => f.path).filter(Boolean);
     
-    return uploadedFiles;
+    try {
+      for (const file of files) {
+        try {
+          const fileType = this.getFileType(file);
+          const fileName = this.sanitizeFileName(file.originalname);
+          const storagePath = `projects/${userId}/${projectId}/${fileType}s/${fileName}`;
+          
+          // Upload file (temp cleanup happens inside uploadToFirebase)
+          const uploadResult = await this.uploadToFirebase(file, storagePath);
+          
+          const fileData = {
+            ...uploadResult,
+            type: fileType,
+            filename: fileName
+          };
+          
+          if (fileType === 'model') {
+            uploadedFiles.models.push(fileData);
+          } else {
+            uploadedFiles.attachments.push({
+              ...fileData,
+              description: this.getFileDescription(fileType)
+            });
+          }
+          
+        } catch (error) {
+          console.error(`❌ Failed to upload ${file.originalname}:`, error);
+          // Continue with other files, but ensure cleanup happens
+        }
+      }
+      
+      return uploadedFiles;
+      
+    } catch (error) {
+      console.error('❌ Error in uploadProjectFiles:', error);
+      throw error;
+    } finally {
+      // ✅ NEW: Final safety cleanup for any remaining temp files
+      await this.cleanupTempFiles(tempFilesToCleanup.map(path => ({ path })))
+        .catch(err => console.warn('⚠️ Final cleanup warning:', err.message));
+    }
   }
   
   /**
-   * Upload banner image
+   * Upload banner image with temp cleanup
    * @param {Object} file - Multer file object for banner
    * @param {string} userId - User ID
    * @param {string} projectId - Project ID
@@ -122,7 +162,119 @@ class FileService {
     const fileName = `banner${path.extname(file.originalname)}`;
     const storagePath = `projects/${userId}/${projectId}/${fileName}`;
     
+    // ✅ IMPROVED: uploadToFirebase now handles temp cleanup automatically
     return await this.uploadToFirebase(file, storagePath);
+  }
+  
+  /**
+   * ✅ NEW: Clean up a single temp file with better error handling
+   * @param {string} filePath - Path to temp file
+   */
+  async cleanupSingleTempFile(filePath) {
+    if (!filePath) return;
+    
+    try {
+      // Check if file exists before trying to delete
+      await fs.access(filePath);
+      await fs.unlink(filePath);
+      
+      this.tempFilesCleanedUp.add(filePath);
+      console.log(`🗑️ Cleaned up temp file: ${path.basename(filePath)}`);
+      
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        // File doesn't exist - that's fine, it's already "cleaned up"
+        console.log(`🔍 Temp file already removed: ${path.basename(filePath)}`);
+      } else {
+        console.error(`⚠️ Error cleaning up ${filePath}:`, error.message);
+        throw error;
+      }
+    }
+  }
+  
+  /**
+   * ✅ ENHANCED: Clean up temporary files with better error handling
+   * @param {Array} files - Array of file objects with path property
+   */
+  async cleanupTempFiles(files) {
+    if (!files || files.length === 0) {
+      console.log('🧹 No temp files to clean up');
+      return;
+    }
+    
+    console.log(`🧹 Cleaning up ${files.length} temp files`);
+    
+    const cleanupPromises = files.map(async (file) => {
+      if (file && file.path) {
+        try {
+          await this.cleanupSingleTempFile(file.path);
+        } catch (error) {
+          console.error(`❌ Failed to cleanup ${file.path}:`, error.message);
+          // Don't throw - continue with other files
+        }
+      }
+    });
+    
+    // Wait for all cleanup operations to complete
+    await Promise.allSettled(cleanupPromises);
+    
+    console.log('✅ Temp file cleanup completed');
+  }
+  
+  /**
+   * ✅ NEW: Enhanced cleanup with fallback strategies
+   * @param {Array} filePaths - Array of file paths (strings)
+   */
+  async enhancedCleanupByPaths(filePaths) {
+    if (!filePaths || filePaths.length === 0) return;
+    
+    console.log(`🧹 Enhanced cleanup for ${filePaths.length} files`);
+    
+    for (const filePath of filePaths) {
+      if (!filePath || typeof filePath !== 'string') continue;
+      
+      try {
+        await this.cleanupSingleTempFile(filePath);
+      } catch (error) {
+        console.warn(`⚠️ Cleanup failed for ${filePath}, trying fallback`);
+        
+        // Fallback: Force delete without checking existence
+        try {
+          await fs.unlink(filePath);
+          console.log(`🔧 Fallback cleanup successful: ${path.basename(filePath)}`);
+        } catch (fallbackError) {
+          console.error(`💥 Fallback cleanup failed: ${filePath}`, fallbackError.message);
+        }
+      }
+    }
+  }
+  
+  /**
+   * ✅ NEW: Get temp file statistics (for debugging)
+   */
+  getTempFileStats() {
+    return {
+      created: this.tempFilesCreated.size,
+      cleaned: this.tempFilesCleanedUp.size,
+      potential_leaks: this.tempFilesCreated.size - this.tempFilesCleanedUp.size
+    };
+  }
+  
+  /**
+   * ✅ NEW: Force cleanup of all tracked temp files (emergency cleanup)
+   */
+  async emergencyCleanup() {
+    console.log('🚨 Emergency cleanup initiated');
+    
+    const uncleanedFiles = Array.from(this.tempFilesCreated)
+      .filter(file => !this.tempFilesCleanedUp.has(file));
+    
+    if (uncleanedFiles.length > 0) {
+      console.log(`🧹 Emergency cleaning ${uncleanedFiles.length} uncleaned files`);
+      await this.enhancedCleanupByPaths(uncleanedFiles);
+    } else {
+      console.log('✅ No files need emergency cleanup');
+    }
   }
   
   /**
@@ -183,36 +335,21 @@ class FileService {
   }
   
   /**
-   * Clean up temporary files
-   * @param {Array} files - Array of file objects with path property
-   */
-  async cleanupTempFiles(files) {
-    for (const file of files) {
-      try {
-        if (file.path) {
-          await fs.unlink(file.path);
-          console.log(`Cleaned up temp file: ${file.path}`);
-        }
-      } catch (error) {
-        console.error(`Error cleaning up ${file.path}:`, error);
-        // Continue with other files
-      }
-    }
-  }
-  
-  /**
    * Delete file from Firebase Storage
    * @param {string} storagePath - Path in Firebase Storage
    */
   async deleteFromFirebase(storagePath) {
     try {
-      // --- FIX: Use the storage object directly ---
       const bucket = storage.bucket();
       await bucket.file(storagePath).delete();
-      console.log(`Deleted file: ${storagePath}`);
+      console.log(`🗑️ Deleted from Firebase: ${storagePath}`);
     } catch (error) {
-      console.error(`Error deleting ${storagePath}:`, error);
-      throw error;
+      if (error.code === 404) {
+        console.log(`🔍 File not found in Firebase (already deleted): ${storagePath}`);
+      } else {
+        console.error(`❌ Error deleting ${storagePath}:`, error);
+        throw error;
+      }
     }
   }
   

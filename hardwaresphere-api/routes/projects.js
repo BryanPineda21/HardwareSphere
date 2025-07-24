@@ -107,12 +107,28 @@ router.delete('/:id', verifyFirebaseToken, async (req, res) => {
 router.post('/:id/view', async (req, res) => {
   try {
     const projectId = req.params.id;
-    const projectRef = admin.firestore().collection('projects').doc(projectId);
-    await projectRef.update({ 'stats.views': admin.firestore.FieldValue.increment(1) });
     
-    // 🚀 NEW: Invalidate project cache (view count changed)
-    await redisClient.del(`project:${projectId}`);
-    console.log(`💾 Cache invalidated for view count update: ${projectId}`);
+    // Create unique identifier (handles both authenticated and anonymous users)
+    const userIdentifier = req.user?.uid || req.ip || 'unknown';
+    const viewKey = `view:${projectId}:${userIdentifier}`;
+    
+    console.log(`🔍 Checking view cooldown for: ${viewKey}`);
+    
+    // Check if this user already viewed this project recently
+    const recentView = await redisClient.get(viewKey);
+    
+    if (!recentView) {
+      // Count the view and set 1-hour cooldown
+      const projectRef = admin.firestore().collection('projects').doc(projectId);
+      await projectRef.update({ 'stats.views': admin.firestore.FieldValue.increment(1) });
+      
+      // Set 1-hour cooldown (3600 seconds)
+      await redisClient.set(viewKey, 'viewed', 3600);
+      
+      console.log(`✅ New view counted for project: ${projectId}, user: ${userIdentifier}`);
+    } else {
+      console.log(`⏳ View cooldown active for project: ${projectId}, user: ${userIdentifier}`);
+    }
     
     res.status(200).send({ success: true });
   } catch (error) {

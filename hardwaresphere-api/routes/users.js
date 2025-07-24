@@ -7,10 +7,17 @@ const { URL } = require('url');
 const path = require('path');
 const fs = require('fs').promises;
 
+// 🚀 NEW: Import Redis caching
+const { cache } = require('../middleware/cache');
+const redisClient = require('../config/redis');
+
 const router = express.Router();
 
 // Use memory storage to handle file buffers directly
 const upload = multer({ storage: multer.memoryStorage() });
+
+// 🚀 NEW: Cache middleware for user profiles (10 minutes)
+const cacheUserProfile = cache((req) => `user:${req.params.username}:profile`, 600);
 
 const parseUsername = (input, hostname) => {
   if (!input) return '';
@@ -27,8 +34,8 @@ const parseUsername = (input, hostname) => {
   }
 };
 
-// Get public user profile by username (no changes needed here)
-router.get('/:username', optionalVerifyFirebaseToken, async (req, res) => {
+// Get public user profile by username (WITH CACHING)
+router.get('/:username', optionalVerifyFirebaseToken, cacheUserProfile, async (req, res) => {
   try {
     const username = req.params.username;
     const userQuery = await firestore.collection('users').where('username', '==', username).limit(1).get();
@@ -75,8 +82,7 @@ router.get('/:username', optionalVerifyFirebaseToken, async (req, res) => {
   }
 });
 
-
-// --- REVISED: Update current user profile endpoint ---
+// --- Update current user profile endpoint (WITH CACHE INVALIDATION) ---
 router.put(
   '/me',
   verifyFirebaseToken,
@@ -88,12 +94,17 @@ router.put(
 
     try {
       const userRef = firestore.collection('users').doc(uid);
+      
+      // 🚀 NEW: Get current username for cache invalidation
+      const currentUserDoc = await userRef.get();
+      const currentUserData = currentUserDoc.data();
+      const oldUsername = currentUserData?.username;
+      
       const updateData = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
 
       // --- Username Validation ---
       if (username) {
-        const currentUserDoc = await userRef.get();
-        const currentUsername = currentUserDoc.data()?.username;
+        const currentUsername = currentUserData?.username;
         if (username !== currentUsername) {
           const usernameQuery = await firestore.collection('users').where('username', '==', username).limit(1).get();
           if (!usernameQuery.empty) {
@@ -105,7 +116,6 @@ router.put(
 
       // --- File Upload Logic with Cache Busting ---
       const uploadFile = async (file, type) => {
-        // --- FIX: Add a timestamp to the filename to ensure a unique URL ---
         const timestamp = Date.now();
         const originalFilename = `${type}-${timestamp}.jpg`;
         const tempPath = `/tmp/${uid}-${originalFilename}`;
@@ -149,6 +159,22 @@ router.put(
       // --- Atomically Update Firestore ---
       await userRef.set(updateData, { merge: true });
 
+      // 🚀 NEW: Invalidate user profile cache
+      if (oldUsername) {
+        await redisClient.del(`user:${oldUsername}:profile`);
+        console.log(`💾 Cache invalidated for user profile: ${oldUsername}`);
+      }
+      
+      // If username changed, also invalidate the new username cache (just in case)
+      if (username && username !== oldUsername) {
+        await redisClient.del(`user:${username}:profile`);
+        console.log(`💾 Cache invalidated for new username: ${username}`);
+      }
+
+      // Also invalidate user's project list cache (since profile changes might affect it)
+      await redisClient.del(`user:${uid}:projects`);
+      console.log(`💾 Cache invalidated for user projects: ${uid}`);
+
       const updatedUserDoc = await userRef.get();
       res.json({
         message: 'Profile updated successfully',
@@ -161,8 +187,7 @@ router.put(
   }
 );
 
-
-// Check if a username is available
+// Check if a username is available (NO CACHING - real-time check needed)
 router.post('/username-check', verifyFirebaseToken, async (req, res) => {
   const { username } = req.body;
   if (!username || username.length < 3) {
@@ -186,13 +211,16 @@ router.post('/username-check', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-
-// Toggle pin status (no changes needed here)
+// Toggle pin status (WITH CACHE INVALIDATION)
 router.post('/projects/:projectId/toggle-pin', verifyFirebaseToken, async (req, res) => {
   try {
     const { projectId } = req.params;
     const { uid } = req.user;
     const projectRef = firestore.collection('projects').doc(projectId);
+
+    // 🚀 NEW: Get user's username for cache invalidation
+    const userDoc = await firestore.collection('users').doc(uid).get();
+    const username = userDoc.data()?.username;
 
     await firestore.runTransaction(async (transaction) => {
       const projectDoc = await transaction.get(projectRef);
@@ -209,6 +237,17 @@ router.post('/projects/:projectId/toggle-pin', verifyFirebaseToken, async (req, 
       }
       transaction.update(projectRef, { isPinned: !currentlyPinned });
     });
+
+    // 🚀 NEW: Invalidate user profile cache (pinned projects changed)
+    if (username) {
+      await redisClient.del(`user:${username}:profile`);
+      console.log(`💾 Cache invalidated for pin toggle - user profile: ${username}`);
+    }
+    
+    // Also invalidate user's project list cache
+    await redisClient.del(`user:${uid}:projects`);
+    console.log(`💾 Cache invalidated for pin toggle - user projects: ${uid}`);
+
     res.json({ success: true, message: 'Pin status updated.' });
   } catch (error) {
     console.error('Error toggling pin:', error);

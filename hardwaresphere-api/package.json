@@ -29,6 +29,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.1",
     "node-blob": "^0.0.2",
+    "redis": "^5.6.1",
     "three": "^0.178.0",
     "winston": "^3.17.0"
   },

@@ -4,7 +4,7 @@ const rateLimit = require('express-rate-limit');
 const corsMiddleware = require('./middleware/cors'); // Assuming this handles your CORS configuration
 const { verifyFirebaseToken } = require('./middleware/auth'); // Correct destructuring import
 const projectRoutes = require('./routes/projects');
-
+const redisClient = require('./config/redis'); // Ensure this points to your Redis config
 
 // Import routes
 const authRoutes = require('./routes/auth'); // Contains auth-related endpoints
@@ -12,6 +12,7 @@ const userRoutes = require('./routes/users');
 
 // Initialize Express app
 const app = express();
+
 
 // =====================================================================
 // GLOBAL MIDDLEWARE
@@ -93,10 +94,32 @@ app.use('/api/users', userRoutes);
 // This should always be the LAST middleware in your chain.
 // =====================================================================
 
+
+// Redis client for caching
+app.get('/test-redis', async (req, res) => {
+  try {
+    // Test Redis connection
+    await redisClient.set('test:key', { message: 'Redis is working!' }, 60);
+    const testData = await redisClient.get('test:key');
+    
+    res.json({
+      redis_connected: redisClient.isConnected,
+      test_data: testData,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 // Catch-all for 404 Not Found errors
 app.use((req, res, next) => {
   res.status(404).json({ error: 'Not Found', message: `The requested URL ${req.originalUrl} was not found on this server.` });
 });
+
+
 
 // Global error handler
 // This middleware catches errors thrown by other middleware or route handlers.

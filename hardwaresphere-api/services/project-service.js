@@ -59,7 +59,9 @@ class ProjectService {
       this.getUsernameFromUserId(userId),
       this.getDisplayNameFromUserId(userId),
       this.getAvatarFromUserId(userId), // Fetches the user's avatar URL
+      // UPDATED THIS LINE
       fileService.uploadToFirebase(stlFile, `projects/${userId}/${projectId}/models/${stlFile.originalname}`),
+      
       bannerFile ? fileService.uploadBannerImage(bannerFile, userId, projectId) : Promise.resolve(null),
       fileService.uploadProjectFiles(otherFiles, userId, projectId)
     ]);
@@ -148,9 +150,9 @@ class ProjectService {
     if (newModelFile) {
       if (existingProject.files?.model?.stl?.storagePath) pathsToDelete.add(existingProject.files.model.stl.storagePath);
       if (existingProject.files?.model?.glb?.storagePath) pathsToDelete.add(existingProject.files.model.glb.storagePath);
-
+      // UPDATED THIS LINE
       const modelUploadResult = await fileService.uploadToFirebase(newModelFile, `projects/${userId}/${projectId}/models/${newModelFile.originalname}`);
-      
+
       finalUpdate['files.model.stl'] = {
         filename: modelUploadResult.originalName,
         size: modelUploadResult.size,
@@ -372,6 +374,56 @@ class ProjectService {
     }
   }
 
+    async startBackgroundConversion(projectId, userId, stlFiles) {
+    console.log(`🔄 Starting background conversion for project ${projectId}`);
+    const tempFilesToCleanup = stlFiles.map(f => f.path).filter(Boolean);
+    
+    try {
+      for (let i = 0; i < stlFiles.length; i++) {
+        const stlFile = stlFiles[i];
+        try {
+          await this.updateConversionStatus(projectId, { 
+            currentFile: stlFile.originalname, 
+            progress: Math.round((i / stlFiles.length) * 100) 
+          });
+          const glbResult = await this.convertStlFile(projectId, userId, stlFile);
+          await this.addConvertedFile(projectId, stlFile.originalname, glbResult);
+          
+          // ✅ Clean up this STL temp file after successful conversion
+          if (stlFile.path) {
+            await this.enhancedCleanup([stlFile.path], `STL temp file after conversion: ${stlFile.originalname}`);
+          }
+          
+        } catch (error) {
+          await this.addConversionError(projectId, stlFile.originalname, error.message);
+          
+          // ✅ Clean up STL temp file even on conversion error
+          if (stlFile.path) {
+            await this.enhancedCleanup([stlFile.path], `STL temp file after failed conversion: ${stlFile.originalname}`);
+          }
+        }
+      }
+
+      // ✅ Cache invalidation after all conversions complete
+      try {
+        await redisClient.del(`project:${projectId}`);
+        console.log(`💾 Cache invalidated after background conversion: ${projectId}`);
+      } catch (cacheError) {
+        console.warn('Cache invalidation failed after background conversion:', cacheError.message);
+      }
+
+    } finally {
+      // ✅ SAFETY: Final cleanup for any remaining temp files
+      await this.enhancedCleanup(tempFilesToCleanup, "final safety cleanup after background conversion");
+      await this.updateConversionStatus(projectId, { 
+        inProgress: false, 
+        completed: true, 
+        completedAt: new Date(), 
+        progress: 100 
+      });
+    }
+  }
+
   async startBackgroundConversionForUpdate(projectId, userId, stlFile) {
     console.log(`🔄 Starting background conversion for updated model in project ${projectId}`);
     const tempFilesToCleanup = [stlFile.path].filter(Boolean);
@@ -379,6 +431,7 @@ class ProjectService {
     try {
       await new Promise(resolve => setTimeout(resolve, 500));
       const glbResult = await this.convertStlFile(projectId, userId, stlFile);
+      
       await firestore.runTransaction(async (transaction) => {
         const projectRef = firestore.collection('projects').doc(projectId);
         transaction.update(projectRef, {
@@ -398,12 +451,17 @@ class ProjectService {
         });
       });
 
-      // ✅ NEW: Invalidate cache after conversion completes
+      // ✅ Cache invalidation after conversion
       try {
         await redisClient.del(`project:${projectId}`);
         console.log(`💾 Cache invalidated after model conversion: ${projectId}`);
       } catch (cacheError) {
         console.warn('Cache invalidation failed after conversion:', cacheError.message);
+      }
+
+      // ✅ Clean up STL temp file after successful conversion
+      if (stlFile.path) {
+        await this.enhancedCleanup([stlFile.path], `STL temp file after update conversion: ${stlFile.originalname}`);
       }
 
     } catch (error) {
@@ -413,49 +471,16 @@ class ProjectService {
         completed: true, 
         completedAt: new Date() 
       });
+      
+      // ✅ Clean up STL temp file even on conversion error
+      if (stlFile.path) {
+        await this.enhancedCleanup([stlFile.path], `STL temp file after failed update conversion: ${stlFile.originalname}`);
+      }
+      
       throw error;
     } finally {
-      // ✅ IMPROVED: Always clean up temp files
-      await this.enhancedCleanup(tempFilesToCleanup, "background conversion update cleanup");
-    }
-  }
-
-  async startBackgroundConversion(projectId, userId, stlFiles) {
-    console.log(`🔄 Starting background conversion for project ${projectId}`);
-    const tempFilesToCleanup = stlFiles.map(f => f.path).filter(Boolean);
-    
-    try {
-      for (let i = 0; i < stlFiles.length; i++) {
-        const stlFile = stlFiles[i];
-        try {
-          await this.updateConversionStatus(projectId, { 
-            currentFile: stlFile.originalname, 
-            progress: Math.round((i / stlFiles.length) * 100) 
-          });
-          const glbResult = await this.convertStlFile(projectId, userId, stlFile);
-          await this.addConvertedFile(projectId, stlFile.originalname, glbResult);
-        } catch (error) {
-          await this.addConversionError(projectId, stlFile.originalname, error.message);
-        }
-      }
-
-      // ✅ NEW: Invalidate cache after all conversions complete
-      try {
-        await redisClient.del(`project:${projectId}`);
-        console.log(`💾 Cache invalidated after background conversion: ${projectId}`);
-      } catch (cacheError) {
-        console.warn('Cache invalidation failed after background conversion:', cacheError.message);
-      }
-
-    } finally {
-      // ✅ IMPROVED: Always clean up ALL temp files
-      await this.enhancedCleanup(tempFilesToCleanup, "background conversion cleanup");
-      await this.updateConversionStatus(projectId, { 
-        inProgress: false, 
-        completed: true, 
-        completedAt: new Date(), 
-        progress: 100 
-      });
+      // ✅ SAFETY: Final cleanup
+      await this.enhancedCleanup(tempFilesToCleanup, "final safety cleanup after background conversion update");
     }
   }
 

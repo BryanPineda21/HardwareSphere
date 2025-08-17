@@ -56,6 +56,9 @@ interface UserProfile {
   allProjects: Project[]; 
 }
 
+
+// ✅ IMPROVED: Better image error handling with retry
+
 // --- Skeleton Loader for a smoother loading experience ---
 const ProfileSkeleton = () => (
   <div className="min-h-screen bg-slate-50 dark:bg-slate-900 animate-pulse">
@@ -110,6 +113,8 @@ export default function UserProfilePage() {
     }
   }, [profile?.backgroundImage]);
 
+
+  
   const fetchUserProfile = useCallback(async () => {
     if (!username) return;
     

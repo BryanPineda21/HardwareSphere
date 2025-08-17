@@ -15,78 +15,87 @@ class FileService {
    * @param {string} storagePath - Path in Firebase Storage (e.g., 'projects/userId/projectId/model.stl')
    * @returns {Promise<Object>} - Object with downloadURL and metadata
    */
+  
   async uploadToFirebase(file, storagePath) {
     let tempFilePath = null;
     
     try {
-      console.log(`📤 Uploading ${file.originalname} to ${storagePath}`);
-      
-      // Track temp file if it exists
-      if (file.path) {
-        tempFilePath = file.path;
-        this.tempFilesCreated.add(tempFilePath);
-      }
-      
-      const bucket = storage.bucket();
-      const fileUpload = bucket.file(storagePath);
-
-      // 1. Read the file asynchronously first
-      const buffer = await fs.readFile(file.path);
-      
-      // Create upload stream
-      const stream = fileUpload.createWriteStream({
-        metadata: {
-          contentType: file.mimetype,
-          metadata: {
-            originalName: file.originalname,
-            uploadedAt: new Date().toISOString()
-          }
+        console.log(`📤 Uploading ${file.originalname} to ${storagePath}`);
+        
+        // Track temp file if it exists
+        if (file.path) {
+            tempFilePath = file.path;
+            this.tempFilesCreated.add(tempFilePath);
         }
-      });
-      
-      // 2. Upload the buffer using a promise-wrapped stream
-      await new Promise((resolve, reject) => {
-        stream.on('error', reject);
-        stream.on('finish', resolve);
-        stream.end(buffer);
-      });
-      
-      // Make file publicly readable
-      await fileUpload.makePublic();
-      
-      // Get download URL
-      const downloadURL = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
-      
-      // Get file metadata
-      const [metadata] = await fileUpload.getMetadata();
-      
-      console.log(`✅ Successfully uploaded ${file.originalname}`);
-      
-      // ✅ NEW: Clean up temp file immediately after successful upload
-      if (tempFilePath) {
-        await this.cleanupSingleTempFile(tempFilePath);
-      }
-      
-      return {
-        url: downloadURL,
-        size: parseInt(metadata.size),
-        contentType: metadata.contentType,
-        uploadedAt: metadata.metadata?.uploadedAt,
-        originalName: file.originalname,
-        storagePath: storagePath
-      };
-      
+        
+        const bucket = storage.bucket();
+        const fileUpload = bucket.file(storagePath);
+
+        // 1. Read the file asynchronously first
+        const buffer = await fs.readFile(file.path);
+        
+        // Create upload stream
+        const stream = fileUpload.createWriteStream({
+            metadata: {
+                contentType: file.mimetype,
+                metadata: {
+                    originalName: file.originalname,
+                    uploadedAt: new Date().toISOString()
+                }
+            }
+        });
+        
+        // 2. Upload the buffer using a promise-wrapped stream
+        await new Promise((resolve, reject) => {
+            stream.on('error', reject);
+            stream.on('finish', resolve);
+            stream.end(buffer);
+        });
+        
+        // --- 🛑 REMOVED ---
+        // await fileUpload.makePublic();
+        // This line was removed. Files are now private by default and will be
+        // protected by your Storage Security Rules. This is essential for your
+        // public/private project feature to work correctly.
+        
+        // --- 🛑 REMOVED ---
+        // const downloadURL = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+        // The permanent public URL is no longer generated. Instead, your backend will
+        // create temporary, secure signed URLs on-demand when a user needs to view or
+        // download a file, as seen in your `project-service.js`.
+
+        // Get file metadata
+        const [metadata] = await fileUpload.getMetadata();
+        
+        console.log(`✅ Successfully uploaded ${file.originalname}`);
+        
+        // Clean up temp file immediately after successful upload
+        if (tempFilePath) {
+            await this.cleanupSingleTempFile(tempFilePath);
+        }
+        
+        // --- ✨ IMPROVED RETURN VALUE ---
+        // The function no longer returns a public 'url'. It returns the 'storagePath',
+        // which is used to identify the file for generating signed URLs or for deletion.
+        return {
+            size: parseInt(metadata.size),
+            contentType: metadata.contentType,
+            uploadedAt: metadata.metadata?.uploadedAt,
+            originalName: file.originalname,
+            storagePath: storagePath // This is now the key piece of information
+        };
+        
     } catch (error) {
-      console.error(`❌ Error uploading ${file.originalname}:`, error);
-      
-      // ✅ NEW: Clean up temp file even on upload failure
-      if (tempFilePath) {
-        await this.cleanupSingleTempFile(tempFilePath).catch(cleanupErr => 
-          console.warn(`⚠️ Cleanup failed for ${tempFilePath}:`, cleanupErr.message)
-        );
-      }
-      
-      throw new Error(`Failed to upload ${file.originalname}: ${error.message}`);
+        console.error(`❌ Error uploading ${file.originalname}:`, error);
+        
+        // Clean up temp file even on upload failure
+        if (tempFilePath) {
+            await this.cleanupSingleTempFile(tempFilePath).catch(cleanupErr => 
+                console.warn(`⚠️ Cleanup failed for ${tempFilePath}:`, cleanupErr.message)
+            );
+        }
+        
+        throw new Error(`Failed to upload ${file.originalname}: ${error.message}`);
     }
   }
   

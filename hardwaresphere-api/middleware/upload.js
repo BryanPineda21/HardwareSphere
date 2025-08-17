@@ -2,10 +2,10 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
 
-// ✅ NEW: Track uploaded temp files for cleanup safety net
+// Track uploaded temp files for cleanup safety net
 const tempFileTracker = new Set();
 
-// ✅ IMPROVED: Better temp file organization
+// IMPROVED: Better temp file organization
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     try {
@@ -40,7 +40,7 @@ const storage = multer.diskStorage({
   }
 });
 
-// ✅ NEW: Enhanced file filter with better error messages
+// Enhanced file filter with better error messages
 const fileFilter = (req, file, cb) => {
   const allowedTypes = {
     // 3D Models
@@ -73,7 +73,7 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-// ✅ IMPROVED: Configure multer with better error handling
+// Configure multer with better error handling
 const upload = multer({
   storage: storage,
   limits: {
@@ -83,16 +83,16 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// ✅ NEW: Middleware to track temp files for cleanup
+// MODIFIED: Middleware to track temp files for cleanup (excluding STL files for conversion)
 const trackTempFiles = (req, res, next) => {
   // Store original end function
   const originalEnd = res.end;
   
   // Override res.end to ensure cleanup
   res.end = function(...args) {
-    // Clean up temp files after response
+    // Clean up temp files after response (excluding STL files)
     setImmediate(() => {
-      cleanupRequestTempFiles(req);
+      cleanupRequestTempFiles(req, { excludeStlFiles: true });
     });
     
     // Call original end function
@@ -101,19 +101,28 @@ const trackTempFiles = (req, res, next) => {
   
   // Track files in request for cleanup
   req.tempFilesToCleanup = new Set();
+  req.stlFilesForConversion = new Set(); // NEW: Track STL files separately
   
   next();
 };
 
-// ✅ NEW: Add temp files to cleanup tracker
+// MODIFIED: Add temp files to cleanup tracker (with STL file separation)
 const addToTempTracker = (req, res, next) => {
   if (req.files) {
     // Handle multiple field uploads
     Object.values(req.files).flat().forEach(file => {
       if (file.path) {
         tempFileTracker.add(file.path);
-        req.tempFilesToCleanup?.add(file.path);
-        console.log(`📁 Temp file tracked: ${path.basename(file.path)}`);
+        
+        // NEW: Separate STL files from regular cleanup
+        const isStlFile = file.originalname.toLowerCase().endsWith('.stl');
+        if (isStlFile) {
+          req.stlFilesForConversion?.add(file.path);
+          console.log(`📁 STL file tracked for conversion: ${path.basename(file.path)}`);
+        } else {
+          req.tempFilesToCleanup?.add(file.path);
+          console.log(`📁 Temp file tracked: ${path.basename(file.path)}`);
+        }
       }
     });
   }
@@ -121,22 +130,38 @@ const addToTempTracker = (req, res, next) => {
   if (req.file && req.file.path) {
     // Handle single file uploads
     tempFileTracker.add(req.file.path);
-    req.tempFilesToCleanup?.add(req.file.path);
-    console.log(`📁 Temp file tracked: ${path.basename(req.file.path)}`);
+    
+    const isStlFile = req.file.originalname.toLowerCase().endsWith('.stl');
+    if (isStlFile) {
+      req.stlFilesForConversion?.add(req.file.path);
+      console.log(`📁 STL file tracked for conversion: ${path.basename(req.file.path)}`);
+    } else {
+      req.tempFilesToCleanup?.add(req.file.path);
+      console.log(`📁 Temp file tracked: ${path.basename(req.file.path)}`);
+    }
   }
   
   next();
 };
 
-// ✅ NEW: Clean up temp files for a specific request
-async function cleanupRequestTempFiles(req) {
+// MODIFIED: Clean up temp files for a specific request (with STL exclusion option)
+async function cleanupRequestTempFiles(req, options = {}) {
+  const { excludeStlFiles = false } = options;
+  
   if (!req.tempFilesToCleanup || req.tempFilesToCleanup.size === 0) {
+    console.log('🧹 No temp files to clean up');
     return;
   }
   
-  console.log(`🧹 Safety cleanup for ${req.tempFilesToCleanup.size} temp files`);
+  console.log(`🧹 Safety cleanup for ${req.tempFilesToCleanup.size} temp files${excludeStlFiles ? ' (excluding STL files)' : ''}`);
   
   for (const filePath of req.tempFilesToCleanup) {
+    // NEW: Skip STL files if excludeStlFiles is true
+    if (excludeStlFiles && filePath.toLowerCase().endsWith('.stl')) {
+      console.log(`⏳ STL file cleanup skipped for conversion: ${path.basename(filePath)}`);
+      continue;
+    }
+    
     try {
       await fs.access(filePath); // Check if file exists
       await fs.unlink(filePath);
@@ -154,7 +179,32 @@ async function cleanupRequestTempFiles(req) {
   }
 }
 
-// ✅ NEW: Emergency cleanup function for old temp files
+// NEW: Function to clean up STL files after conversion
+async function cleanupStlFilesFromRequest(req) {
+  if (!req.stlFilesForConversion || req.stlFilesForConversion.size === 0) {
+    return;
+  }
+  
+  console.log(`🧹 Cleaning up ${req.stlFilesForConversion.size} STL files after conversion`);
+  
+  for (const filePath of req.stlFilesForConversion) {
+    try {
+      await fs.access(filePath); // Check if file exists
+      await fs.unlink(filePath);
+      tempFileTracker.delete(filePath);
+      console.log(`🗑️ STL cleanup after conversion: ${path.basename(filePath)}`);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        tempFileTracker.delete(filePath);
+        console.log(`✅ STL file already cleaned: ${path.basename(filePath)}`);
+      } else {
+        console.warn(`⚠️ STL cleanup failed: ${path.basename(filePath)} - ${error.message}`);
+      }
+    }
+  }
+}
+
+// Emergency cleanup function for old temp files
 async function emergencyCleanupOldTempFiles() {
   try {
     const uploadsDir = 'uploads/';
@@ -211,10 +261,10 @@ async function emergencyCleanupOldTempFiles() {
   }
 }
 
-// ✅ NEW: Schedule periodic cleanup (every 30 minutes)
+// Schedule periodic cleanup (every 30 minutes)
 setInterval(emergencyCleanupOldTempFiles, 30 * 60 * 1000);
 
-// ✅ NEW: Cleanup on process exit
+// Cleanup on process exit
 process.on('SIGTERM', async () => {
   console.log('🧹 Process terminating, cleaning up temp files...');
   await emergencyCleanupOldTempFiles();
@@ -225,7 +275,7 @@ process.on('SIGINT', async () => {
   await emergencyCleanupOldTempFiles();
 });
 
-// ✅ IMPROVED: Enhanced error handler with temp file cleanup
+// Enhanced error handler with temp file cleanup
 const handleUploadError = async (err, req, res, next) => {
   // Clean up temp files if upload failed
   if (req.files || req.file) {
@@ -271,7 +321,7 @@ const handleUploadError = async (err, req, res, next) => {
   next(err);
 };
 
-// ✅ NEW: Get temp file statistics
+// Get temp file statistics
 const getTempFileStats = () => {
   return {
     tracked_files: tempFileTracker.size,
@@ -312,8 +362,9 @@ module.exports = {
   // Error handler with cleanup
   handleUploadError,
   
-  // ✅ NEW: Utility functions
+  // Utility functions
   getTempFileStats,
   emergencyCleanupOldTempFiles,
-  cleanupRequestTempFiles
+  cleanupRequestTempFiles,
+  cleanupStlFilesFromRequest  // NEW: For cleaning STL files after conversion
 };

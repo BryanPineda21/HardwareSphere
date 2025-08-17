@@ -144,14 +144,16 @@ class FileService {
    * @returns {Promise<Object>} - Upload result
    */
   async uploadBannerImage(file, userId, projectId) {
-    if (!file) return null;
-    
-    const fileName = `banner${path.extname(file.originalname)}`;
-    const storagePath = `projects/${userId}/${projectId}/${fileName}`;
-    
-    // ✅ IMPROVED: uploadToFirebase now handles temp cleanup automatically
-    return await this.uploadToFirebase(file, storagePath);
-  }
+  if (!file) return null;
+  
+  // ✅ FIXED: Add timestamp for cache busting
+  const timestamp = Date.now();
+  const extension = path.extname(file.originalname);
+  const fileName = `banner-${timestamp}${extension}`;
+  const storagePath = `projects/${userId}/${projectId}/${fileName}`;
+  
+  return await this.uploadToFirebase(file, storagePath);
+}
   
   /**
    * ✅ NEW: Clean up a single temp file with better error handling

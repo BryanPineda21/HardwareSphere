@@ -1,6 +1,36 @@
 const { storage } = require('../config/firebase'); // Import the initialized storage instance
 const fs = require('fs').promises;
 const path = require('path');
+const sharp = require('sharp');
+
+// Compress image for web
+async function compressImageForWeb(inputPath, originalName, maxWidth = 1920) {
+  const ext = path.extname(originalName).toLowerCase();
+  const isImage = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
+  
+  if (!isImage) return null;
+  
+  const compressedPath = inputPath + '_compressed.webp';
+  
+  try {
+    await sharp(inputPath)
+      .resize(maxWidth, null, { 
+        fit: 'inside', 
+        withoutEnlargement: true 
+      })
+      .webp({ 
+        quality: 80,
+        effort: 6
+      })
+      .toFile(compressedPath);
+    
+    return compressedPath;
+  } catch (error) {
+    console.warn(`Image compression failed for ${originalName}:`, error.message);
+    return null;
+  }
+}
+
 
 class FileService {
   constructor() {
@@ -143,17 +173,39 @@ class FileService {
    * @param {string} projectId - Project ID
    * @returns {Promise<Object>} - Upload result
    */
-  async uploadBannerImage(file, userId, projectId) {
-  if (!file) return null;
-  
-  // ✅ FIXED: Add timestamp for cache busting
-  const timestamp = Date.now();
-  const extension = path.extname(file.originalname);
-  const fileName = `banner-${timestamp}${extension}`;
-  const storagePath = `projects/${userId}/${projectId}/${fileName}`;
-  
-  return await this.uploadToFirebase(file, storagePath);
-}
+    async uploadBannerImage(file, userId, projectId) {
+    if (!file) return null;
+    
+    // Compress the image first
+    const compressedPath = await compressImageForWeb(file.path, file.originalname, 1200);
+    
+    if (compressedPath) {
+      const timestamp = Date.now();
+      const fileName = `banner-${timestamp}.webp`;
+      const storagePath = `projects/${userId}/${projectId}/${fileName}`;
+      
+      const compressedFile = {
+        path: compressedPath,
+        originalname: fileName,
+        mimetype: 'image/webp'
+      };
+      
+      const result = await this.uploadToFirebase(compressedFile, storagePath);
+      
+      // Clean up compressed temp file
+      await this.cleanupSingleTempFile(compressedPath);
+      
+      return result;
+    }
+    
+    // Fallback to original if compression fails
+    const timestamp = Date.now();
+    const extension = path.extname(file.originalname);
+    const fileName = `banner-${timestamp}${extension}`;
+    const storagePath = `projects/${userId}/${projectId}/${fileName}`;
+    
+    return await this.uploadToFirebase(file, storagePath);
+  }
   
   /**
    * ✅ NEW: Clean up a single temp file with better error handling

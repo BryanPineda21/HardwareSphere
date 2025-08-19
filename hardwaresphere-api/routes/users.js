@@ -6,6 +6,7 @@ const multer = require('multer');
 const { URL } = require('url');
 const path = require('path');
 const fs = require('fs').promises;
+const sharp = require('sharp');
 // 🚀 NEW: Import Redis caching
 const { cache } = require('../middleware/cache');
 const redisClient = require('../config/redis');
@@ -13,6 +14,38 @@ const redisClient = require('../config/redis');
 const router = express.Router();
 // Use memory storage to handle file buffers directly
 const upload = multer({ storage: multer.memoryStorage() });
+
+// 🚀 NEW: Compress user images
+async function compressUserImage(inputPath, originalName, type) {
+  const ext = path.extname(originalName).toLowerCase();
+  const isImage = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
+  
+  if (!isImage) return null;
+  
+  const compressedPath = inputPath + '_compressed.webp';
+  
+  // Different sizes for different image types
+  const maxWidth = type === 'avatar' ? 400 : 1920; // Avatar: 400px, Background: 1920px
+  const quality = type === 'avatar' ? 85 : 75; // Higher quality for avatars
+  
+  try {
+    await sharp(inputPath)
+      .resize(maxWidth, null, { 
+        fit: 'inside', 
+        withoutEnlargement: true 
+      })
+      .webp({ 
+        quality: quality,
+        effort: 6
+      })
+      .toFile(compressedPath);
+    
+    return compressedPath;
+  } catch (error) {
+    console.warn(`User image compression failed for ${originalName}:`, error.message);
+    return null;
+  }
+}
 
 // Add generateSignedUrl function
 async function generateSignedUrl(filePath) {
@@ -158,11 +191,36 @@ router.put(
       // --- File Upload Logic with Cache Busting ---
       const uploadFile = async (file, type) => {
         const timestamp = Date.now();
-        const originalFilename = `${type}-${timestamp}.jpg`;
-        const tempPath = `/tmp/${uid}-${originalFilename}`;
+        const tempPath = `/tmp/${uid}-${type}-${timestamp}`;
         
+        // Write buffer to temp file
         await fs.writeFile(tempPath, file.buffer);
         
+        // Compress the image
+        const compressedPath = await compressUserImage(tempPath, file.originalname, type);
+        
+        if (compressedPath) {
+          // Use compressed version
+          const compressedFilename = `${type}-${timestamp}.webp`;
+          const storagePath = `users/${uid}/${compressedFilename}`;
+          
+          const result = await fileService.uploadToFirebase({
+            path: compressedPath,
+            originalname: compressedFilename,
+            mimetype: 'image/webp',
+          }, storagePath);
+          
+          // Clean up both temp files
+          await fs.unlink(tempPath);
+          await fs.unlink(compressedPath);
+          
+          // Generate signed URL for immediate use
+          const signedUrl = await generateSignedUrl(result.storagePath);
+          return signedUrl;
+        }
+        
+        // Fallback to original if compression fails
+        const originalFilename = `${type}-${timestamp}${path.extname(file.originalname)}`;
         const storagePath = `users/${uid}/${originalFilename}`;
         
         const result = await fileService.uploadToFirebase({
@@ -172,7 +230,10 @@ router.put(
         }, storagePath);
         
         await fs.unlink(tempPath);
-        return result.url;
+        
+        // Generate signed URL for immediate use
+        const signedUrl = await generateSignedUrl(result.storagePath);
+        return signedUrl;
       };
 
       if (files?.avatar?.[0]) {

@@ -188,10 +188,13 @@ router.put(
         }
       }
 
-      // --- File Upload Logic with Cache Busting ---
+      // --- File Upload Logic with Compression, Cache Busting, and Cleanup ---
       const uploadFile = async (file, type) => {
         const timestamp = Date.now();
         const tempPath = `/tmp/${uid}-${type}-${timestamp}`;
+        
+        // Get current storage path for deletion
+        const currentStoragePath = currentUserData[type === 'avatar' ? 'avatarStoragePath' : 'backgroundStoragePath'];
         
         // Write buffer to temp file
         await fs.writeFile(tempPath, file.buffer);
@@ -210,13 +213,22 @@ router.put(
             mimetype: 'image/webp',
           }, storagePath);
           
-          // Clean up both temp files
+          // Clean up temp files
           await fs.unlink(tempPath);
           await fs.unlink(compressedPath);
           
-          // Generate signed URL for immediate use
-          const signedUrl = await generateSignedUrl(result.storagePath);
-          return signedUrl;
+          // Delete old image if it exists
+          if (currentStoragePath) {
+            try {
+              await fileService.deleteFromFirebase(currentStoragePath);
+              console.log(`🗑️ Deleted old ${type}: ${currentStoragePath}`);
+            } catch (error) {
+              console.warn(`Failed to delete old ${type}:`, error.message);
+            }
+          }
+          
+          // Return storage path instead of signed URL
+          return result.storagePath;
         }
         
         // Fallback to original if compression fails
@@ -231,16 +243,29 @@ router.put(
         
         await fs.unlink(tempPath);
         
-        // Generate signed URL for immediate use
-        const signedUrl = await generateSignedUrl(result.storagePath);
-        return signedUrl;
+        // Delete old image if it exists
+        if (currentStoragePath) {
+          try {
+            await fileService.deleteFromFirebase(currentStoragePath);
+            console.log(`🗑️ Deleted old ${type}: ${currentStoragePath}`);
+          } catch (error) {
+            console.warn(`Failed to delete old ${type}:`, error.message);
+          }
+        }
+        
+        return result.storagePath;
       };
 
+      // Update the file handling logic
       if (files?.avatar?.[0]) {
-        updateData.avatar = await uploadFile(files.avatar[0], 'avatar');
+        const avatarStoragePath = await uploadFile(files.avatar[0], 'avatar');
+        updateData.avatarStoragePath = avatarStoragePath;
+        updateData.avatar = await generateSignedUrl(avatarStoragePath); // Generate signed URL
       }
       if (files?.backgroundImage?.[0]) {
-        updateData.backgroundImage = await uploadFile(files.backgroundImage[0], 'background');
+        const backgroundStoragePath = await uploadFile(files.backgroundImage[0], 'background');
+        updateData.backgroundStoragePath = backgroundStoragePath;
+        updateData.backgroundImage = await generateSignedUrl(backgroundStoragePath); // Generate signed URL
       }
 
       // --- Text and Array Fields ---

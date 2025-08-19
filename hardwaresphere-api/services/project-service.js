@@ -30,6 +30,36 @@ async function generateSignedUrl(filePath) {
   }
 }
 
+
+// Helper function to invalidate all user-related caches
+async function invalidateUserCaches(userId, projectId = null) {
+  try {
+    // Get username for profile cache invalidation
+    const userDoc = await firestore.collection('users').doc(userId).get();
+    const username = userDoc.data()?.username;
+    
+    const cacheKeys = [
+      `user:${userId}:projects`,  // User projects cache (projects.js)
+      ...(username ? [`user:${username}:profile`] : []), // User profile cache (users.js)
+      ...(projectId ? [`project:${projectId}`] : []) // Individual project cache
+    ];
+    
+    // Invalidate all relevant caches
+    const deletePromises = cacheKeys.map(key => 
+      redisClient.del(key).then(() => 
+        console.log(`💾 Cache invalidated: ${key}`)
+      ).catch(err => 
+        console.warn(`⚠️ Cache invalidation failed for ${key}:`, err.message)
+      )
+    );
+    
+    await Promise.all(deletePromises);
+    
+  } catch (error) {
+    console.warn('Cache invalidation failed:', error.message);
+  }
+}
+
 class ProjectService {
 
   async createProject(userId, projectData, files) {
@@ -102,6 +132,8 @@ class ProjectService {
 
     await projectRef.set(newProject);
     console.log(`Project document ${projectId} created successfully.`);
+    await invalidateUserCaches(userId, projectId);
+
 
     if (stlFile.path) {
       setTimeout(() => {
@@ -196,12 +228,9 @@ class ProjectService {
     await projectRef.update(finalUpdate);
 
     // ✅ NEW: Invalidate Redis cache when project is updated
-    try {
-      await redisClient.del(`project:${projectId}`);
-      console.log(`💾 Cache invalidated for updated project: ${projectId}`);
-    } catch (cacheError) {
-      console.warn('Cache invalidation failed:', cacheError.message);
-    }
+    // Invalidate all user-related caches  
+    await invalidateUserCaches(userId, projectId);
+
 
     if (newModelFile && newModelFile.path) {
       setTimeout(() => {
@@ -332,14 +361,9 @@ class ProjectService {
     await projectRef.delete();
 
     // ✅ NEW: Invalidate cache when project is deleted
-    try {
-      await redisClient.del(`project:${projectId}`);
-      await redisClient.del(`user:${userId}:projects`);
-      console.log(`💾 Cache invalidated for deleted project: ${projectId}`);
-    } catch (cacheError) {
-      console.warn('Cache invalidation failed:', cacheError.message);
-    }
-
+    // Invalidate all user-related caches
+    await invalidateUserCaches(userId, projectId);
+    
     return { success: true, message: 'Project and all associated files deleted.' };
   }
 
@@ -405,12 +429,8 @@ class ProjectService {
       }
 
       // ✅ Cache invalidation after all conversions complete
-      try {
-        await redisClient.del(`project:${projectId}`);
-        console.log(`💾 Cache invalidated after background conversion: ${projectId}`);
-      } catch (cacheError) {
-        console.warn('Cache invalidation failed after background conversion:', cacheError.message);
-      }
+      // After conversion completes, invalidate caches
+      await invalidateUserCaches(userId, projectId);
 
     } finally {
       // ✅ SAFETY: Final cleanup for any remaining temp files
@@ -452,12 +472,8 @@ class ProjectService {
       });
 
       // ✅ Cache invalidation after conversion
-      try {
-        await redisClient.del(`project:${projectId}`);
-        console.log(`💾 Cache invalidated after model conversion: ${projectId}`);
-      } catch (cacheError) {
-        console.warn('Cache invalidation failed after conversion:', cacheError.message);
-      }
+      // After conversion completes, invalidate caches
+      await invalidateUserCaches(userId, projectId);
 
       // ✅ Clean up STL temp file after successful conversion
       if (stlFile.path) {

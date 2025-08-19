@@ -1,20 +1,37 @@
 const express = require('express');
 const { verifyFirebaseToken, optionalVerifyFirebaseToken } = require('../middleware/auth');
-const { firestore, admin } = require('../config/firebase');
+const { firestore, admin, storage } = require('../config/firebase');
 const fileService = require('../services/file-service');
 const multer = require('multer');
 const { URL } = require('url');
 const path = require('path');
 const fs = require('fs').promises;
-
 // 🚀 NEW: Import Redis caching
 const { cache } = require('../middleware/cache');
 const redisClient = require('../config/redis');
 
 const router = express.Router();
-
 // Use memory storage to handle file buffers directly
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Add generateSignedUrl function
+async function generateSignedUrl(filePath) {
+  if (!filePath) return null;
+  
+  const options = {
+    version: 'v4',
+    action: 'read',
+    expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+  };
+
+  try {
+    const [url] = await storage.bucket().file(filePath).getSignedUrl(options);
+    return url;
+  } catch (error) {
+    console.warn(`Could not generate signed URL for ${filePath}: ${error.message}`);
+    return null;
+  }
+}
 
 // 🚀 NEW: Cache middleware for user profiles (10 minutes)
 const cacheUserProfile = cache((req) => `user:${req.params.username}:profile`, 600);
@@ -54,8 +71,32 @@ router.get('/:username', optionalVerifyFirebaseToken, cacheUserProfile, async (r
     const allProjectsSnapshot = await projectsQuery.orderBy('createdAt', 'desc').get();
     const allProjects = allProjectsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-    const pinnedProjects = allProjects.filter(p => p.isPinned);
-    const otherProjects = allProjects.filter(p => !p.isPinned);
+    // Generate signed URLs for thumbnails
+    const projectsWithSignedUrls = await Promise.all(
+      allProjects.map(async (project) => {
+        if (project.files?.thumbnail?.storagePath) {
+          const thumbnailUrl = await generateSignedUrl(project.files.thumbnail.storagePath);
+          return {
+            ...project,
+            files: {
+              ...project.files,
+              thumbnail: {
+                ...project.files.thumbnail,
+                url: thumbnailUrl
+              }
+            }
+          };
+        }
+        return project;
+      })
+    );
+
+    const pinnedProjects = projectsWithSignedUrls.filter(p => p.isPinned);
+    const otherProjects = projectsWithSignedUrls.filter(p => !p.isPinned);
+
+
+
+
 
     const publicProfile = {
       id: userDoc.id,

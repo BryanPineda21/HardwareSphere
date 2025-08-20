@@ -54,7 +54,10 @@ async function generateSignedUrl(filePath) {
   const options = {
     version: 'v4',
     action: 'read',
-    expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+    expires: Date.now() + 6 * 60 * 60 * 1000, // 6 hours
+    responseHeaders: {
+      'Cache-Control': 'public, max-age=21600' // 6 hours browser cache
+    }
   };
 
   try {
@@ -130,14 +133,14 @@ router.get('/:username', optionalVerifyFirebaseToken, cacheUserProfile, async (r
 
 
 
-
+    // LEFT OF HERE, NEEDS FIXING
     const publicProfile = {
       id: userDoc.id,
       displayName: userData.displayName,
       username: userData.username,
       bio: userData.bio || '',
-      avatar: userData.avatar,
-      backgroundImage: userData.backgroundImage,
+      avatar: userData.avatarStoragePath ? await generateSignedUrl(userData.avatarStoragePath) : userData.avatar,
+      backgroundImage: userData.backgroundStoragePath ? await generateSignedUrl(userData.backgroundStoragePath) : userData.backgroundImage,
       github: userData.github,
       linkedin: userData.linkedin,
       skills: userData.skills || [],
@@ -147,7 +150,6 @@ router.get('/:username', optionalVerifyFirebaseToken, cacheUserProfile, async (r
       pinnedProjects,
       otherProjects
     };
-
     res.json(publicProfile);
     
   } catch (error) {
@@ -257,15 +259,13 @@ router.put(
       };
 
       // Update the file handling logic
-      if (files?.avatar?.[0]) {
+      if (files?.avatar?.[0]){
         const avatarStoragePath = await uploadFile(files.avatar[0], 'avatar');
         updateData.avatarStoragePath = avatarStoragePath;
-        updateData.avatar = await generateSignedUrl(avatarStoragePath); // Generate signed URL
       }
       if (files?.backgroundImage?.[0]) {
         const backgroundStoragePath = await uploadFile(files.backgroundImage[0], 'background');
         updateData.backgroundStoragePath = backgroundStoragePath;
-        updateData.backgroundImage = await generateSignedUrl(backgroundStoragePath); // Generate signed URL
       }
 
       // --- Text and Array Fields ---
